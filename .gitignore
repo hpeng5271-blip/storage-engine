@@ -2,3 +2,6 @@
 data.bin
 data.idx
 *.log
+test_data/
+demo_data/
+*.sst
