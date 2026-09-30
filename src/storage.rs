@@ -3,20 +3,17 @@ use std::fs;
 use crate::memtable::{MemTable, TOMBSTONE};
 use crate::sstable::SSTable;
 use crate::wal::{Wal, OP_PUT, OP_DELETE};
+use crate::manifest::Manifest;
 
-/// 层数：L0 + L1 + L2 + L3
 const NUM_LEVELS: usize = 4;
 
 pub struct Storage {
     memtable: MemTable,
     wal: Wal,
-    /// levels[0] = L0，levels[1] = L1，以此类推
-    /// L0 允许 key 重叠，L1+ 不重叠
     levels: Vec<Vec<SSTable>>,
-    /// 每层触发向下合并的 SSTable 数量阈值
     level_thresholds: Vec<usize>,
     flush_threshold: usize,
-    sstable_counter: u32,
+    manifest: Manifest,
     data_dir: String,
 }
 
@@ -24,11 +21,10 @@ impl Storage {
     pub fn open(data_dir: &str, flush_threshold: usize) -> std::io::Result<Self> {
         fs::create_dir_all(data_dir)?;
 
-        // WAL
+        // --- WAL 恢复 ---
         let wal_path = format!("{}/wal.log", data_dir);
         let mut wal = Wal::open(&wal_path)?;
 
-        // WAL 恢复
         let mut memtable = MemTable::new();
         for (op, k, v) in wal.replay()? {
             if op == OP_PUT {
@@ -38,37 +34,20 @@ impl Storage {
             }
         }
 
-        // 扫描已有 SSTable 文件，按层级归位
+        // --- 从 Manifest 加载 ---
+        let manifest = Manifest::load(data_dir)?;
+
+        // 按层打开所有 SSTable
         let mut levels: Vec<Vec<SSTable>> = (0..NUM_LEVELS).map(|_| Vec::new()).collect();
-        let mut counter: u32 = 0;
 
-        for entry in fs::read_dir(data_dir)? {
-            let entry = entry?;
-            let name = entry.file_name().into_string().unwrap();
+        for entry in &manifest.entries {
+            if entry.level >= NUM_LEVELS { continue; }
+            // 跳过 __counter__ 这个特殊项
+            if entry.file == "__counter__" { continue; }
 
-            if !name.ends_with(".sst") { continue; }
-
-            // 文件名格式：L{level}_{counter}.sst
-            let level = match name.strip_prefix('L')
-                .and_then(|s| s.split_once('_'))
-                .and_then(|(lvl, _)| lvl.parse::<usize>().ok())
-            {
-                Some(l) if l < NUM_LEVELS => l,
-                _ => continue,
-            };
-
-            let path = format!("{}/{}", data_dir, name);
+            let path = format!("{}/{}", data_dir, entry.file);
             if let Ok(sst) = SSTable::open(&path, 4096) {
-                levels[level].push(sst);
-            }
-
-            // 从文件名提取 counter
-            if let Some(rest) = name.strip_prefix(&format!("L{}_", level)) {
-                if let Some(num_str) = rest.strip_suffix(".sst") {
-                    if let Ok(n) = num_str.parse::<u32>() {
-                        if n + 1 > counter { counter = n + 1; }
-                    }
-                }
+                levels[entry.level].push(sst);
             }
         }
 
@@ -81,10 +60,9 @@ impl Storage {
             memtable,
             wal,
             levels,
-            // L0 累积 3 个就向下合并；L1/L2 累积 2 个；L3 是最后一层不合并
             level_thresholds: vec![3, 2, 2, usize::MAX],
             flush_threshold,
-            sstable_counter: counter,
+            manifest,
             data_dir: data_dir.to_string(),
         })
     }
@@ -110,13 +88,13 @@ impl Storage {
     }
 
     pub fn get(&self, key: &str) -> std::io::Result<Option<String>> {
-        // 1. MemTable（最新）
+        // 1. MemTable
         if let Some(v) = self.memtable.get(key) {
             if v == TOMBSTONE { return Ok(None); }
             return Ok(Some(v.clone()));
         }
 
-        // 2. 从 L0 到 L3，每层从新到旧
+        // 2. 从 L0 到 L3
         for level in self.levels.iter() {
             for sst in level.iter().rev() {
                 if let Some(v) = sst.get(key)? {
@@ -140,7 +118,7 @@ impl Storage {
                 }
             }
         }
-        // 最后是 MemTable
+        // MemTable
         for (k, v) in self.memtable.scan(start, end) {
             merged.insert(k, v);
         }
@@ -149,50 +127,61 @@ impl Storage {
         Ok(merged.into_iter().collect())
     }
 
-    /// MemTable 刷盘 → L0，然后检查是否要往下合并
     pub fn flush(&mut self) -> std::io::Result<()> {
         if self.memtable.is_empty() { return Ok(()); }
 
-        let path = format!("{}/L0_{:06}.sst", self.data_dir, self.sstable_counter);
+        let id = self.manifest.next_counter();
+        let filename = format!("L0_{:06}.sst", id);
+        let path = format!("{}/{}", self.data_dir, filename);
+
         let sst = SSTable::write(&path, self.memtable.data(), 4096)?;
-        println!("[flush] L0 ← {} 条记录 ({})", sst.len(), path);
+        println!("[flush] L0 ← {} 条记录 ({})", sst.len(), filename);
 
         self.levels[0].push(sst);
-        self.sstable_counter += 1;
+        self.manifest.add(0, filename);
+        self.manifest.save(&self.data_dir)?;
+
         self.memtable.clear();
         self.wal.clear()?;
 
-        // 从 L0 开始检查是否触发合并
         self.maybe_compact(0)?;
 
         Ok(())
     }
 
-    /// 递归：Ln 满了就合并到 Ln+1，然后检查 Ln+1
     fn maybe_compact(&mut self, level: usize) -> std::io::Result<()> {
-        // 最后一层不合并
         if level + 1 >= self.levels.len() {
             return Ok(());
         }
-        // 本层未满
         if self.levels[level].len() < self.level_thresholds[level] {
             return Ok(());
         }
 
+        // 从内存和 manifest 里一起移除本层的文件
         let to_merge = std::mem::take(&mut self.levels[level]);
+        let old_files = self.manifest.take_level(level);
         let count = to_merge.len();
 
-        let new_path = format!("{}/L{}_{:06}.sst",
-                               self.data_dir, level + 1, self.sstable_counter);
-        self.sstable_counter += 1;
+        // 分配新编号
+        let id = self.manifest.next_counter();
+        let new_filename = format!("L{}_{:06}.sst", level + 1, id);
+        let new_path = format!("{}/{}", self.data_dir, new_filename);
 
+        // 物理合并
         let new_sst = crate::compaction::compact_all(to_merge, &new_path)?;
-        println!("[compact] L{} ({}) → L{} ({} 条)",
-                 level, count, level + 1, new_sst.len());
 
+        // 删除旧文件的 manifest 记录（已经 take_level 清空），加新的
         self.levels[level + 1].push(new_sst);
+        self.manifest.add(level + 1, new_filename);
 
-        // 递归检查下一层
+        // 保存 manifest（原子）
+        self.manifest.save(&self.data_dir)?;
+
+        println!("[compact] L{} ({}) → L{} ({} 条, 旧文件 {} 个)",
+                 level, count, level + 1,
+                 self.levels[level + 1].last().unwrap().len(),
+                 old_files.len());
+
         self.maybe_compact(level + 1)?;
 
         Ok(())
@@ -207,7 +196,6 @@ impl Storage {
     }
 
     pub fn first_sstable_path(&self) -> Option<String> {
-        // 优先返回最深层（最大的文件）
         for level in self.levels.iter().rev() {
             if let Some(sst) = level.first() {
                 return Some(sst.path.clone());
